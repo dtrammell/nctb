@@ -9,7 +9,7 @@ require 'cryptomnio'
 require 'date'
 require 'pp'
 require 'syslog'
-require 'twitter'
+require 'nostr_ruby'
 require 'yaml'
 
 ##
@@ -19,17 +19,17 @@ require 'yaml'
 VERBOSITY = 3
 
 # TCTBot Class
-class TCTBot
+class NCTBot
 
 	##
 	# Instance Constants
 
 	# The application's Name
-	APPNAME = "TCTBot"
+	APPNAME = "NCTBot"
 	# The application's Version
-	VERSION = "0.1.6"
+	VERSION = "0.1.7"
 	# The application's working directory within the user's home directory
-	WORKING_DIR = Dir.home + '/.tctb/'
+	WORKING_DIR = Dir.home + '/.nctb/'
 	# SPEEDMODE causes the bot to run in a compressed timeframe, 1 min == 1 sec
 	SPEEDMODE = false
 
@@ -115,7 +115,7 @@ class TCTBot
 
 	# Read YAML Configuration File into config data structure
 	def load_config
-		filename = Pathname.new( WORKING_DIR + 'tctb.config' )
+		filename = Pathname.new( WORKING_DIR + 'nctb.config' )
 		raise "Config File '%s' NOT FOUND" % filename if ! filename.exist?
 		configfile = YAML.load( File.open( filename ).read )
 		Syslog.info( "Configuration loaded from '%s':" % filename )
@@ -132,7 +132,7 @@ class TCTBot
 
 	# Load YAML file for persistent state variables
 	def load_state
-		filename = Pathname.new( WORKING_DIR + 'tctb.state' )
+		filename = Pathname.new( WORKING_DIR + 'nctb.state' )
 		if ! filename.exist?
 			# File doesn't exist, initialize it
 			message = "WARNING: State File '%s' NOT FOUND; Initializing" % filename
@@ -168,7 +168,7 @@ class TCTBot
 
 	# Save YAML file for persistent state variables
 	def save_state
-		filename = Pathname.new( WORKING_DIR + 'tctb.state' )
+		filename = Pathname.new( WORKING_DIR + 'nctb.state' )
 		File.open( filename, 'w' ) {|f| f.write @persist.to_yaml }
 		return true
 	rescue => e
@@ -258,26 +258,6 @@ class TCTBot
 		return leaders[0..(entries - 1)]
 	end
 
-	# Twitter.update wrapper to add length checking and debug output. Tweets <tweet>, optionally in reply to <in_reply_to_status_id>
-	def tweet( tweet, in_reply_to_status_id: nil )
-		# Check to ensure that the tweet isn't too long
-		if tweet.length > 280
-			message = "ERROR: Poll tweet too long! (%d characters)" % tweet.length
-			Syslog.err( message )
-			raise message
-		end
-
-		# DEBUG Output
-		puts "Tweeting:\n'''\n%s\n'''" % tweet if VERBOSITY >= 2
-
-		# Tweet the tweet and save the tweet as the last tweet
-		@persist[:lasttweet] = @twitter.update( tweet, in_reply_to_status_id: in_reply_to_status_id ) 
-		self.save_state
-
-		# Return the tweet
-		return @persist[:lasttweet]
-	end
-
    # Update Account Balances from exchange
    def update_balances
 		# Get individual balances from exchange
@@ -319,23 +299,55 @@ class TCTBot
 		@ticker
 	end
 
-	# Connect the object instance to its configured Twitter account
-	def connect_twitter
-		# Get Twitter Handle from config
-		@twitter_handle = @configfile[:twitter][:username]
+	# Configure the object instance to its configured Nostr private key
+	def nostr_config
+		# Get Nostr private key from config
+		@priv_key = @configfile[:nostr][:privkey]
 
-		# Create Twitter client object
-		twitter = Twitter::REST::Client.new do |c|
-			c.consumer_key        = @configfile[:twitter][:consumer_key]
-			c.consumer_secret     = @configfile[:twitter][:consumer_secret]
-			c.access_token        = @configfile[:twitter][:access_token]
-			c.access_token_secret = @configfile[:twitter][:access_token_secret]
-		end
+		# Create Nostr client object
+		$nostr = Nostr.new( { private_key: @priv_key } )
+
+		# Create and send Nostr Metadata Event
+		$nostr.nostr_metadata_send
 
 		# Output
-		Syslog.info( "Connected to Twitter as '%s'" % @twitter_handle ) if VERBOSITY >= 1
+		Syslog.info( "Configured for Nostr as '%s'" % @configfile[:nostr][:name] ) if VERBOSITY >= 1
 
 		return twitter
+	end
+
+	# Nostr build.note.event wrapper to add length checking and debug output. Sends <note>, optionally as a reaction to <react_to_id>
+	def nostr_note_event( note, react_to_id: nil )
+		# DEBUG Output
+		puts "Sending Note:\n'''\n%s\n'''" % note if VERBOSITY >= 2
+
+		# Send the note and save the note as the last note 
+		if react_to_id
+			@persist[:lastnote] = @nostr.build_reaction_event( note, react_to_id ) 
+		else
+			@persist[:lastnote] = @nostr.build_note_event( note, react_to_id ) 
+		end
+		self.save_state
+
+		# Return the note
+		return @persist[:lastnote].dup
+	end
+
+	# Send a Nostr Metadata Event
+	def nostr_metadata_send
+		@bot = Hash.new
+		@bot[:name]    = @configfile[:nostr][:name],
+		@bot[:about]   = @configfile[:nostr][:about],
+		@bot[:picture] = @configfile[:nostr][:picture],
+		@bot[:nip05}   = @configfile[:nostr][:nip05]
+		$nostr.nostr_note_event(
+			$nostr.build_metadata_event(
+				@bot[:name],
+				@bot[:about],
+				@bot[:picture],
+				@bot[:nip05]
+			)
+		)
 	end
 
 	# Connect the object instance to its configured Cryptomnio account
@@ -374,7 +386,7 @@ class TCTBot
 	def start
 
 		# Connect Twitter
-		@twitter = self.connect_twitter
+		$nostr = self.nostr_config
 
 		# Connect Cryptomnio
 		@cryptomnio = self.connect_cryptomnio
@@ -383,11 +395,14 @@ class TCTBot
 		self.update_balances
 		Syslog.info("Account Balances at startup: %s: %s | %s: $%s" % [ @base_currency, @base_balance, @quot_currency, @quot_balance ] ) if $VERBOSE
 
-		# Retireve most recent tweet (index 0 of returned Enumerable)
-		# TODO: Find most recent POLL tweet, not just the most recent one (which may not be the poll)
-		@persist[:lasttweet] = @twitter.user_timeline( @twitter_handle, count: 1 )[0]
-		self.save_state
-		Syslog.info("Most recent %s tweet at startup: \"%s...\"", @twitter_handle, @persist[:lasttweet].text[0,26]) if VERBOSITY >= 1
+		# Determine the most recent poll note if there's not one in state
+		if ! @persist[:lastpoll]
+			# Find last poll note in user feed
+#			@persist[:lastnote] = @twitter.user_timeline( @bot[:name], count: 1 )[0]
+
+			self.save_state
+		end
+		Syslog.info("Most recent %s poll note at startup: \"%s...\"", @bot{:name], @persist[:lastpoll][0][:content][0,26]) if VERBOSITY >= 1
 
 		# Scheduler Loop
 		$second = nil
@@ -438,17 +453,17 @@ class TCTBot
 				when $day == 1 && $hour == 15 && $minute == 58 
 					leaders = self.get_leaderboard( :month, 5 )
 
-					tweet = "%s's Top 5 Monthly Influencers:\n\n" % @twitter_handle
+					note = "%s's Top 5 Monthly Influencers:\n\n" % @bot[:name]
 					count = 0
 					leaders.each do |handle, votecount|
 						count += 1
-						tweet << "%d: @%s with %d votes!\n" % [ count, handle, votecount ] 
+						note << "%d: @%s with %d votes!\n" % [ count, handle, votecount ] 
 					end
 					if count == 0
-						tweet << "No influencers this month ):\n\n"
-						tweet << "Gotta get more votes per poll!!!"
+						note << "No influencers this month ):\n\n"
+						note << "Gotta get more votes per poll!!!"
 					end
-					self.tweet( tweet )
+					self.nostr_note_event( note )
 
 					# TODO: Rotate and save the monthly influencer's file for records
 
@@ -467,17 +482,17 @@ class TCTBot
 				when $hour == 15 && $minute == 59 # Just before Midnight
 #					leaders = self.get_leaderboard( :day, 5 )
 #
-#					tweet = "%s's Top 5 Daily Influencers:\n\n" % @twitter_handle
+#					note = "%s's Top 5 Daily Influencers:\n\n" % @bot[:name]
 #					count = 0
 #					leaders.each do |handle, votecount|
 #						count += 1
-#						tweet << "%d: @%s with %d votes!\n" % [ count, handle, votecount ] 
+#						note << "%d: @%s with %d votes!\n" % [ count, handle, votecount ] 
 #					end
 #					if count == 0
-#						tweet << "No influencers today ):\n\n"
-#						tweet << "Gotta get more votes per poll!!!"
+#						note << "No influencers today ):\n\n"
+#						note << "Gotta get more votes per poll!!!"
 #					end
-#					self.tweet( tweet )
+#					self.nostr_note_event( note )
 #
 #					# Reset the daily influencers count for the new day and safe it to file
 #					@influencers_day = {}
@@ -487,17 +502,17 @@ class TCTBot
 					if @time.saturday?
 						leaders = self.get_leaderboard( :week, 5 )
 				
-						tweet = "%s's Top 5 Weekly Influencers:\n\n" % @twitter_handle
+						note = "%s's Top 5 Weekly Influencers:\n\n" % @bot[:name]
 						count = 0
 						leaders.each do |handle, votecount|
 							count += 1
-							tweet << "%d: @%s with %d votes!\n" % [ count, handle, votecount ] 
+							note << "%d: @%s with %d votes!\n" % [ count, handle, votecount ] 
 						end
 						if count == 0
-							tweet << "No influencers this week ):\n\n"
-							tweet << "Gotta get more votes per poll!!!"
+							note << "No influencers this week ):\n\n"
+							note << "Gotta get more votes per poll!!!"
 						end
-						self.tweet( tweet )
+						self.nostr_note_event( note )
 
 						# Reset the weekly influencers count for the new week
 						@influencers_week = {}
@@ -521,84 +536,84 @@ class TCTBot
 					# Post the new poll
 					message = "Posting a new poll! (ID: %d)" % @pollid
 					Syslog.info( message ) if VERBOSITY >= 1
-					#TODO: Add last order info to this tweet
-					tweet  = "Poll %d: Should I BUY, SELL, or HODL?\n\n" % @pollid
-					tweet << "Current %s/%s Spot: $%s\n\n"               % [ @base_currency, @quot_currency, @ticker['price'] ]
-					tweet << "Balances:\n"
-					tweet << "%s: %s\n"                                  % [ @base_currency, @base_balance ]
-					tweet << "%s: \$%s\n\n"                              % [ @quot_currency, @quot_balance ]
-					tweet << "Reply with one keyword: BUY, SELL, or HODL. Most recent reply is your vote (so you can change your mind), multiple keywords in one reply ignored"
-					self.tweet( tweet )
+					#TODO: Add last order info to this note
+					note  = "Poll %d: Should I BUY, SELL, or HODL?\n\n" % @pollid
+					note << "Current %s/%s Spot Price: $%s\n\n"         % [ @base_currency, @quot_currency, @ticker['price'] ]
+					note << "Balances:\n"
+					note << "%s: %s\n"                                  % [ @base_currency, @base_balance ]
+					note << "%s: \$%s\n\n"                              % [ @quot_currency, @quot_balance ]
+					note << "Reply with one keyword: BUY, SELL, or HODL. Most recent reply is your vote (so you can change your mind), multiple keywords in one reply ignored"
+					self.nostr_note_event( note )
 
 					# Finished with this minute's operation... sleep to ensure this doesn't get called again this hour
 					sleep 60
 
 				when $hour == 15 && $minute == 55 # 13:55 Close the Poll
-					# Retrieve most recent tweet, *should* be the last poll posted
-					# TODO: Find and retrieve the most recent poll tweet instead of assuming the lasttweet is the most recent poll
-					if ! @persist[:lasttweet]
-						# Get the most recent tweet from Twitter
-						$tweets = @twitter.user_timeline(@twitter_handle, count: 1)
-						@persist[:lasttweet] = $tweets[0]
+					# Retrieve most recent poll note, *should* be the last note posted
+					# TODO: Find and retrieve the most recent poll note instead of assuming the lastnote is the most recent poll
+					if ! @persist[:lastpoll]
+						# Get the most recent note from Twitter
+#						$notes = @twitter.user_timeline(@bot[:name], count: 1)
+#						@persist[:lastpoll] = $notes[0]
 						self.save_state
 
 						# Output
-						Syslog.info( "Retrieved most recent %s tweet (poll): \"%s...\"", @twitter_handle, @persist[:lasttweet].text[0,26] ) if VERBOSITY >= 1
 					end
+					Syslog.info( "Retrieved most recent %s poll note: \"%s...\"", @bot[:name], @persist[:lastpoll].text[0,26] ) if VERBOSITY >= 1
 
-					# Extract the Poll ID from the tweet
-					@pollid = @persist[:lasttweet].text[/\b(?<!\.)\d+(?!\.)\b/, 0]
+					# Extract the Poll ID from the note
+					@pollid = @persist[:lastpoll][0][:content].text[/\b(?<!\.)\d+(?!\.)\b/, 0]
 					if ! @pollid
 						# Couldn't get the Poll ID, sleep past this minute and break
-						Syslog.err( "Unable to retrieve Poll ID from most recent tweet! %s", @pollid.inspect )
+						Syslog.err( "Unable to retrieve Poll ID from most recent poll note! %s", @pollid.inspect )
 						sleep 60
 						break
 					end
 					@pollid = @pollid.to_i
 
 					Syslog.info( "Closing Poll %s", @pollid ) if VERBOSITY >= 1
-					if @persist[:lasttweet]
-						# Get all replies to the account after our poll tweet
-						query = "to:%s" % @twitter_handle
-						reply_tweets = @twitter.search(query, since_id: @persist[:lasttweet].id, result_type: "recent")
-						#p reply_tweets if VERBOSITY >= 3
-						Syslog.debug( "Got %d replies to user." % reply_tweets.count ) if $DEBUG
-						Syslog.warning( "WARNING: Got %d replies to user, possibly more than 100 votes!" % reply_tweets.count ) if reply_tweets.count >= 100
-						# TODO: Twitter only returns max 100 responses per query; loop until all replies have been collected.
+					if @persist[:lastpoll]
+						# Get all reactions to the account after our poll note
+# TODO: Update the lastpoll note and parse through its reactions
+#						query = "to:%s" % @bot[:name]
+#						reply_notes = @twitter.search(query, since_id: @persist[:lastnote].id, result_type: "recent")
+						#p reply_notes if VERBOSITY >= 3
+						Syslog.debug( "Got %d reactions to poll." % reply_notes.count ) if $DEBUG
+#						Syslog.warning( "WARNING: Got %d replies to user, possibly more than 100 votes!" % reply_notes.count ) if reply_notes.count >= 100
 
-						# Find subset of replies that replied directly to our poll tweet
+						# Find subset of replies that replied directly to our poll note
 						replies = []
 						index = 0
-						for tweet in reply_tweets do
-							if tweet.in_reply_to_status_id == @persist[:lasttweet].id
-								replies[index] = tweet
+						for note in reply_notes do
+							if note.in_reply_to_status_id == @persist[:lastnote].id
+								replies[index] = note
 								index += 1
 							end
 						end
 
-						# Reverse order so that tweets are in chronological order
+						# Reverse order so that notes are in chronological order
 						replies = replies.reverse
 
 						Syslog.debug( "Got %d replies to poll." % replies.count ) if $DEBUG
 						if VERBOSITY >= 3 
-							for tweet in replies do
-								Syslog.debug( "%s said: \"%s\"" % [ tweet.user.screen_name, tweet.text ] )
+							for note in replies do
+								Syslog.debug( "%s said: \"%s\"" % [ note.user.screen_name, note.text ] )
 							end
 						end
 
 						# Count the votes from replies
 						votes = {}
-						for tweet in replies do
-							# Parse the tweet text for the vote keywords
-							tweet.text =~ /buy/i       ? buy  = true  : buy  = false 
-							tweet.text =~ /sell/i      ? sell = true  : sell = false 
-							tweet.text =~ /hodl|hold/i ? hodl = true  : hodl = false 
-							# Ensure that the tweet only contains one keyword
+						for note in replies do
+							# Parse the note text for the vote keywords
+							note.text =~ /buy/i       ? buy  = true  : buy  = false 
+							note.text =~ /sell/i      ? sell = true  : sell = false 
+							note.text =~ /hodl|hold/i ? hodl = true  : hodl = false 
+							# Ensure that the note only contains one keyword
 							if [buy, sell, hodl].one?
 								# Add the voted keyword to the votes hash. Most recent vote per user will be counted.
-								votes[tweet.user.screen_name] = "BUY"  if buy  == true
-								votes[tweet.user.screen_name] = "SELL" if sell == true
-								votes[tweet.user.screen_name] = "HODL" if hodl == true
+								votes[note.user.screen_name] = "BUY"  if buy  == true
+								votes[note.user.screen_name] = "SELL" if sell == true
+								votes[note.user.screen_name] = "HODL" if hodl == true
 							end
 						end              
 						Syslog.info( "Got %d votes in poll.", votes.size ) if VERBOSITY >= 1
@@ -611,11 +626,11 @@ class TCTBot
 						# Check if we have our minimum threshold of votes. Default to HODL if not
 						if votes.count < @votes_min
 							Syslog.info( "Only received %d votes (minimum %d), HODL!"    % [ votes.count, @votes_min ] ) if VERBOSITY >= 1
-							tweet  = "Voting closed for poll %d.\n\n"                    % @pollid
-							tweet << "Not enough votes to make a decision.  HODL!!!\n\n"
-							tweet << "(Need a minimum of %d votes, got %d votes... "             % [ @votes_min, votes.count ]
-							tweet << "Maybe you should retweet my upcoming poll tweet?)"
-							self.tweet( tweet, in_reply_to_status_id: @persist[:lasttweet].id ) 
+							note  = "Voting closed for poll %d.\n\n"                    % @pollid
+							note << "Not enough votes to make a decision.  HODL!!!\n\n"
+							note << "(Need a minimum of %d votes, got %d votes... "             % [ @votes_min, votes.count ]
+							note << "Maybe you should renote my upcoming poll note?)"
+							self.nostr_note_event( note, in_reply_to_status_id: @persist[:lastnote].id ) 
 							$decision = "HODL"
 						else
 							# We have enough votes!  Make some trades...
@@ -662,8 +677,8 @@ class TCTBot
 								message = "Result of Poll %d was a tie! I'm gonna %s. Vote Tally: [ BUY:  %d (%0.2f%%%%)| SELL: %d (%0.2f%%%%)| HODL: %d (%0.2f%%%%)]" % [@pollid, $decision, tally[:buy], @buy_percentage, tally[:sell], @sell_percentage, tally[:hodl], @hodl_percentage] # strings going to Syslog need double-escapes for format strings
 								Syslog.info(message)
 
-								tweet = "Result of Poll %d was a tie!\n\nI'm gonna %s.\n\nVote Tally:\nBUY:  %d (%0.2f%%)\nSELL: %d (%0.2f%%)\nHODL: %d (%0.2f%%)" % [@pollid, $decision, tally[:buy], @buy_percentage, tally[:sell], @sell_percentage, tally[:hodl], @hodl_percentage]
-								self.tweet( tweet, in_reply_to_status_id: @persist[:lasttweet].id )
+								note = "Result of Poll %d was a tie!\n\nI'm gonna %s.\n\nVote Tally:\nBUY:  %d (%0.2f%%)\nSELL: %d (%0.2f%%)\nHODL: %d (%0.2f%%)" % [@pollid, $decision, tally[:buy], @buy_percentage, tally[:sell], @sell_percentage, tally[:hodl], @hodl_percentage]
+								self.nostr_note_event( note, in_reply_to_status_id: @persist[:lastnote].id )
 							else
 								# Winner!
 								$decision = "BUY"  if winner[1][0] == :buy
@@ -675,13 +690,13 @@ class TCTBot
 								puts message if VERBOSITY >= 2
 								Syslog.info( message.to_s )
 
-								tweet = "The results for Poll %d are in!\n\n%s is the winner!\n\nVote Tally:\nBUY: %d (%0.2f%%)\nSELL: %d (%0.2f%%)\nHODL: %d (%0.2f%%)" % [@pollid, $decision, tally[:buy], @buy_percentage, tally[:sell], @sell_percentage, tally[:hodl], @hodl_percentage]
-								self.tweet( tweet, in_reply_to_status_id: @persist[:lasttweet].id )
+								note = "The results for Poll %d are in!\n\n%s is the winner!\n\nVote Tally:\nBUY: %d (%0.2f%%)\nSELL: %d (%0.2f%%)\nHODL: %d (%0.2f%%)" % [@pollid, $decision, tally[:buy], @buy_percentage, tally[:sell], @sell_percentage, tally[:hodl], @hodl_percentage]
+								self.nostr_note_event( note, in_reply_to_status_id: @persist[:lastnote].id )
 								self.save_state
 							end
 
 						end # if votes.count < 10
-					end # if @persist[:lasttweet]
+					end # if @persist[:lastnote]
 
 					# Execute desired trade via Cryptomnio
 					case $decision
@@ -710,8 +725,8 @@ class TCTBot
 							message = "Attemtped BUY of $%0.2f %s (%0.2f%%%% of $%0.2f %s) is below Bitstamp's minimum order volume limit (0.0002 %s). Gotta HODL!!!" % [ $amount, @quot_currency, @buy_percentage, balance, @quot_currency, @base_currency ]
 							Syslog.info(message)
 			
-							tweet = "Attempted BUY of $%0.2f %s (%0.2f%% of $%0.2f %s / %0.8f %s) is below @Bitstamp's minimum order volume limit (0.0002 %s).\n\nGotta HODL!!!" % [ $amount, @quot_currency, @buy_percentage, balance, @quot_currency, $volume, @base_currency, @base_currency ]
-							self.tweet( tweet, in_reply_to_status_id: @persist[:lasttweet].id )
+							note = "Attempted BUY of $%0.2f %s (%0.2f%% of $%0.2f %s / %0.8f %s) is below @Bitstamp's minimum order volume limit (0.0002 %s).\n\nGotta HODL!!!" % [ $amount, @quot_currency, @buy_percentage, balance, @quot_currency, $volume, @base_currency, @base_currency ]
+							self.nostr_note_event( note, in_reply_to_status_id: @persist[:lastnote].id )
 
 							break
 						end
@@ -746,8 +761,8 @@ class TCTBot
 							message = "Attemtped SELL of %0.8f %s (%0.2f%%%%) is below Bitstamp's minimum order volume limit (0.0002 %s).  Gotta HODL!!!" % [ $volume, @base_currency, @sell_percentage, @base_currency ]
 							Syslog.info(message)
 					
-							tweet = "Attempted SELL of %0.8f %s (%0.2f%%) is below @Bitstamp's minimum order volume limit (0.0002 %s).\n\nGotta HODL!!!" % [ $volume, @base_currency, @sell_percentage, @base_currency ]
-							self.tweet( tweet, in_reply_to_status_id: @persist[:lasttweet].id )
+							note = "Attempted SELL of %0.8f %s (%0.2f%%) is below @Bitstamp's minimum order volume limit (0.0002 %s).\n\nGotta HODL!!!" % [ $volume, @base_currency, @sell_percentage, @base_currency ]
+							self.nostr_note_event( note, in_reply_to_status_id: @persist[:lastnote].id )
 
 							break
 						end
@@ -768,7 +783,7 @@ class TCTBot
 						$order_id = nil
 				end # case $decision
 
-				# TODO: Keep track of last 5 trades or so for a status tweet
+				# TODO: Keep track of last 5 trades or so for a status note
 
 				# Perform trade follow-up tasks if a trade was executed
 				if $order_id
@@ -813,17 +828,17 @@ class TCTBot
 					Syslog.info("Tweeting trade results...")
 					case $decision
 					when "BUY"
-						tweet  = "Trade on @Bitstamp Complete:\n\n"
-						tweet << "BUY %0.2f%% of %s ($%0.2f %s): %s %s\n"     % [ @buy_percentage, @quot_currency, $amount, @quot_currency, $order_info['quantity'], @base_currency ]
-						tweet << "Trading fee: $%0.2f\n\n"                    % $order_info["fee"].to_f
-						tweet << "Trade powered by @Cryptomnio™"
+						note  = "Trade on @Bitstamp Complete:\n\n"
+						note << "BUY %0.2f%% of %s ($%0.2f %s): %s %s\n"     % [ @buy_percentage, @quot_currency, $amount, @quot_currency, $order_info['quantity'], @base_currency ]
+						note << "Trading fee: $%0.2f\n\n"                    % $order_info["fee"].to_f
+						note << "Trade powered by @Cryptomnio™"
 					when "SELL"
-						tweet  = "Trade on @Bitstamp Complete:\n\n"
-						tweet << "SELL %0.2f%% of %s: $%0.8f %s (%s %s)\n"    % [ @sell_percentage, @base_currency, $order_info['quantity'], @base_currency, quot_value, @quot_currency ]
-						tweet << "Trading fee: $%0.2f\n\n"                    % $order_info["fee"].to_f
-						tweet << "Trade powered by @Cryptomnio™"
+						note  = "Trade on @Bitstamp Complete:\n\n"
+						note << "SELL %0.2f%% of %s: $%0.8f %s (%s %s)\n"    % [ @sell_percentage, @base_currency, $order_info['quantity'], @base_currency, quot_value, @quot_currency ]
+						note << "Trading fee: $%0.2f\n\n"                    % $order_info["fee"].to_f
+						note << "Trade powered by @Cryptomnio™"
 					end
-					self.tweet( tweet, in_reply_to_status_id: @persist[:lasttweet].id )
+					self.nostr_note_event( note, in_reply_to_status_id: @persist[:lastnote].id )
 
 					# Sleep for a few seconds so balances can update via the exchange
 					sleep 15
@@ -871,14 +886,14 @@ class TCTBot
 				$quot_start_diff_percent = ($quot_start_diff_value / $quot_total) * 100
 
 				# Post Balances Tweet
-				tweet  = "Current %s/%s Spot: $%s\n\n"          % [ @base_currency, @quot_currency, @ticker['price'] ]
-				tweet << "Current Account Balances:\n\n"
-				tweet << "%s: %0.8f\n(%+0.8f / %+0.2f%%)\n\n"   % [ @base_currency, @base_balance, $base_diff_value, $base_diff_percent ]
-				tweet << "%s: $%0.2f\n($%+0.2f / %+0.2f%%)\n\n" % [ @quot_currency, @quot_balance, $quot_diff_value, $quot_diff_percent ]
-				tweet << "Current Total Account Value Today (Trading):\n\n"
-				tweet << "%s: %0.8f\n(%+0.8f / %+0.2f%%)\n\n"   % [ @base_currency, $base_total, $base_start_diff_value, $base_start_diff_percent ]
-				tweet << "%s: $%0.2f\n($%+0.2f / %+0.2f%%)"     % [ @quot_currency, $quot_total, $quot_start_diff_value, $quot_start_diff_percent ]
-				self.tweet( tweet, in_reply_to_status_id: @persist[:lasttweet].id )
+				note  = "Current %s/%s Spot: $%s\n\n"          % [ @base_currency, @quot_currency, @ticker['price'] ]
+				note << "Current Account Balances:\n\n"
+				note << "%s: %0.8f\n(%+0.8f / %+0.2f%%)\n\n"   % [ @base_currency, @base_balance, $base_diff_value, $base_diff_percent ]
+				note << "%s: $%0.2f\n($%+0.2f / %+0.2f%%)\n\n" % [ @quot_currency, @quot_balance, $quot_diff_value, $quot_diff_percent ]
+				note << "Current Total Account Value Today (Trading):\n\n"
+				note << "%s: %0.8f\n(%+0.8f / %+0.2f%%)\n\n"   % [ @base_currency, $base_total, $base_start_diff_value, $base_start_diff_percent ]
+				note << "%s: $%0.2f\n($%+0.2f / %+0.2f%%)"     % [ @quot_currency, $quot_total, $quot_start_diff_value, $quot_start_diff_percent ]
+				self.nostr_note_event( note, in_reply_to_status_id: @persist[:lastnote].id )
 
 				# Calculate the total original account value in both @base_currenty and @quot_currency
 				orig_base_total_value = @starting_base + ( @starting_quot / @ticker['price'].to_f )
@@ -896,14 +911,14 @@ class TCTBot
 				trading_diff_percent = $quot_start_diff_percent - orig_quot_diff_value_percent
 
 				# Post Balance Compare with Start Tweet
-				tweet  = "Original Account Balances:\n\n"
-				tweet << "%s: %0.8f\n"  % [ @base_currency, orig_base_total_value ]
-				tweet << "%s: $%0.2f\n\n" % [ @quot_currency, orig_quot_total_value ]
-				tweet << "Original Total Account Value Today (HODLing):\n\n"
-				tweet << "%s: %0.8f\n(%+0.8f / %+0.2f%%)\n\n"   % [ @base_currency, $base_total, orig_base_diff_value, orig_base_diff_value_percent ]
-				tweet << "%s: $%0.2f\n($%+0.2f / %+0.2f%%)\n\n" % [ @quot_currency, $quot_total, orig_quot_diff_value, orig_quot_diff_value_percent ]
-				tweet << "Trading vs. Hodling: %+0.2f%%\n\n"    % [ trading_diff_percent ]
-				self.tweet( tweet, in_reply_to_status_id: @persist[:lasttweet].id )
+				note  = "Original Account Balances:\n\n"
+				note << "%s: %0.8f\n"  % [ @base_currency, orig_base_total_value ]
+				note << "%s: $%0.2f\n\n" % [ @quot_currency, orig_quot_total_value ]
+				note << "Original Total Account Value Today (HODLing):\n\n"
+				note << "%s: %0.8f\n(%+0.8f / %+0.2f%%)\n\n"   % [ @base_currency, $base_total, orig_base_diff_value, orig_base_diff_value_percent ]
+				note << "%s: $%0.2f\n($%+0.2f / %+0.2f%%)\n\n" % [ @quot_currency, $quot_total, orig_quot_diff_value, orig_quot_diff_value_percent ]
+				note << "Trading vs. Hodling: %+0.2f%%\n\n"    % [ trading_diff_percent ]
+				self.nostr_note_event( note, in_reply_to_status_id: @persist[:lastnote].id )
 
 				# Wait at least one minute since last operation
 				sleep 60 if ! SPEEDMODE
@@ -931,10 +946,11 @@ class TCTBot
 		self.shutdown
 		exit
 	end # def start
-end # Class TCTBot
+end # Class NCTBot
 
-# Create TCTBot instance
-tctb = TCTBot.new
+# Create NCTBot instance
+nctb = NCTBot.new
 
-# Start TCTBot
-tctb.start
+# Start NCTBot
+nctb.start
+
